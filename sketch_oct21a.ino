@@ -30,6 +30,24 @@ const float HOME[4][3] = {
 float    curAngle[16];
 uint16_t lastUs[16] = {0};
 
+// ---------- 步態參數（A 左前、B 右前、C 左後、D 右後）----------
+constexpr float S = 30;
+const float   CENTER[4]   = {95, 90, 90, 95};
+const int8_t  DIR[4]      = {-1, +1, -1, +1};
+const float   STAND[4][2] = {{130,110},{45,65},{55,75},{130,130}};
+const float   LIFT[4]     = {-40, +40, +40, -40};
+const uint8_t ORDER[4]    = {0, 3, 1, 2};                  // A D B C
+constexpr uint16_t READY_MS = 800;
+constexpr uint16_t LIFT_MS  = 200;
+constexpr uint16_t SWING_MS = 400;
+
+// ---------- 轉向參數 ----------
+constexpr float    TURN_S        = 20;
+constexpr uint8_t  TURN_CYCLES   = 2;
+constexpr uint16_t TURN_BODY_MS  = 1200;
+constexpr uint16_t TURN_LIFT_MS  = 300;
+constexpr uint16_t TURN_SWING_MS = 600;
+
 // ---------- 底層輸出（含遲滯）----------
 void setServoEx(uint8_t ch, float angle, bool force) {
   angle = constrain(angle, 0.0f, 180.0f);
@@ -46,62 +64,125 @@ void setServoEx(uint8_t ch, float angle, bool force) {
 // ---------- 腳緩動 ----------
 constexpr uint32_t UPDATE_MS = 20;
 
-struct Pose { float a[3]; uint16_t ms; };
-struct Seq  { const Pose* p; uint8_t n; };
-struct Phase { Seq s[4]; };   // A B C D 各自要跑的動作，p = nullptr 代表不動
+struct Pose  { float a[3]; uint16_t ms; };
+struct Seq   { const Pose* p; uint8_t n; };
+struct Phase { Seq s[4]; };
 
-#define COUNT(x) ((uint8_t)(sizeof(x) / sizeof((x)[0])))
-#define NONE {nullptr, 0}
+void setPose(Pose& p, uint8_t l, float x, float tibiaOff, uint16_t ms);   // 手動原型
 
-// ===== A、B 腿 =====
-// 第一輪（從 reload 出發）
-const Pose WALK_A[] = { {{ 95,160,160},400}, {{ 30,130, 90},400}, {{ 30,130,110},400} };
-const Pose WALK_B[] = { {{ 90, 20, 20},400}, {{150, 45, 90},400}, {{150, 45, 65},400} };
-// 循環輪（起點 = 上一輪身體階段結尾 A(95,130,110) B(90,45,65)）
-const Pose LOOP_A[] = { {{ 95,130, 90},400}, {{ 30,130, 90},400}, {{ 30,130,110},400} };
-const Pose LOOP_B[] = { {{ 90, 45, 90},400}, {{150, 45, 90},400}, {{150, 45, 65},400} };
+constexpr uint8_t PHASES        = 5;
+constexpr uint8_t TURN_PHASES   = 10;
+constexpr uint8_t SETTLE_PHASES = 4;
+Pose  gaitPose[PHASES][4][3];
+Phase gaitPhase[PHASES];
+Pose  turnPose[TURN_PHASES][4][3];
+Phase turnPhase[TURN_PHASES];
+Pose  standPose[4][1];
+Phase standPhase[1];
+Pose  settlePose[SETTLE_PHASES][2];
+Phase settlePhase[SETTLE_PHASES];
 
-// ===== 身體往前（A 95、B 90、C 48、D 135）=====
-// 第一輪：C、D 只掃髖，femur/tibia 維持 HOME
-const Pose BODY_A[] = { {{ 95,130,110},400} };
-const Pose BODY_B[] = { {{ 90, 45, 65},400} };
-const Pose BODY_C[] = { {{ 48, 20, 22},400} };
-const Pose BODY_D[] = { {{135,160,160},400} };
-// 循環輪：C、D 掃髖的同時直接站立（省掉階段 4、5）
-const Pose LBODY_C[] = { {{ 48, 55, 75},400} };
-const Pose LBODY_D[] = { {{135,130,130},400} };
+float hipAng(uint8_t l, float x) { return CENTER[l] + DIR[l] * x; }
 
-// ===== C、D 站立（只有第一輪）=====
-const Pose STAND_C[] = { {{ 48, 20, 22},400}, {{ 48, 55, 90},400}, {{ 48, 55, 75},400} };
-const Pose STAND_D[] = { {{135,160,160},400}, {{135,130, 90},400}, {{135,130,130},400} };
+void setPose(Pose& p, uint8_t l, float x, float tibiaOff, uint16_t ms) {
+  p.a[0] = hipAng(l, x);
+  p.a[1] = STAND[l][0];
+  p.a[2] = STAND[l][1] + tibiaOff;
+  p.ms = ms;
+}
 
-// ===== C、D 往前 =====
-const Pose FWD_C[] = { {{ 48, 55, 75},400}, {{ 48, 55, 90},400}, {{ 90, 55, 75},400} };
-const Pose FWD_D[] = { {{135,130,130},400}, {{135,130, 90},400}, {{ 95,130,130},400} };
+// ---- 走路 ----
+void buildGait() {
+  float x[4];
+  x[ORDER[0]] = -S;
+  x[ORDER[1]] = -S / 3;
+  x[ORDER[2]] =  S / 3;
+  x[ORDER[3]] =  S;
 
-constexpr uint8_t FIRST_PHASES = 7;
-constexpr uint8_t LOOP_PHASES  = 5;
+  // 階段 1：從任何已知位置（HOME 或站姿）一步到「站姿 + 錯開髖位置」
+  for (uint8_t l = 0; l < 4; l++) {
+    setPose(gaitPose[0][l][0], l, x[l], 0, READY_MS);
+    gaitPhase[0].s[l] = {gaitPose[0][l], 1};
+  }
 
-const Phase FIRST_SET[FIRST_PHASES] = {
-  {{ {WALK_A, COUNT(WALK_A)}, NONE, NONE, NONE }},                      // 1 A 腿
-  {{ NONE, {WALK_B, COUNT(WALK_B)}, NONE, NONE }},                      // 2 B 腿
-  {{ {BODY_A,1}, {BODY_B,1}, {BODY_C,1}, {BODY_D,1} }},                 // 3 身體往前
-  {{ NONE, NONE, {STAND_C, COUNT(STAND_C)}, NONE }},                    // 4 C 站立
-  {{ NONE, NONE, NONE, {STAND_D, COUNT(STAND_D)} }},                    // 5 D 站立
-  {{ NONE, NONE, {FWD_C, COUNT(FWD_C)}, NONE }},                        // 6 C 往前
-  {{ NONE, NONE, NONE, {FWD_D, COUNT(FWD_D)} }},                        // 7 D 往前
-};
+  for (uint8_t k = 0; k < 4; k++) {
+    uint8_t s = ORDER[k];
+    for (uint8_t l = 0; l < 4; l++)
+      setPose(gaitPose[k + 1][l][0], l, x[l], (l == s) ? LIFT[l] : 0, LIFT_MS);
 
-const Phase LOOP_SET[LOOP_PHASES] = {
-  {{ {LOOP_A, COUNT(LOOP_A)}, NONE, NONE, NONE }},                      // 1 A 腿
-  {{ NONE, {LOOP_B, COUNT(LOOP_B)}, NONE, NONE }},                      // 2 B 腿
-  {{ {BODY_A,1}, {BODY_B,1}, {LBODY_C,1}, {LBODY_D,1} }},               // 3 身體往前（C、D 同時站立）
-  {{ NONE, NONE, {FWD_C, COUNT(FWD_C)}, NONE }},                        // 4 C 往前
-  {{ NONE, NONE, NONE, {FWD_D, COUNT(FWD_D)} }},                        // 5 D 往前
-};
+    for (uint8_t l = 0; l < 4; l++) {
+      if (l == s) x[l] = S;
+      else        x[l] -= 2 * S / 3;
+    }
 
-const Phase* curSet    = FIRST_SET;
-uint8_t      curPhases = FIRST_PHASES;
+    for (uint8_t l = 0; l < 4; l++) {
+      Pose* q = gaitPose[k + 1][l];
+      setPose(q[1], l, x[l], (l == s) ? LIFT[l] : 0, SWING_MS);
+      setPose(q[2], l, x[l], 0, LIFT_MS);
+      gaitPhase[k + 1].s[l] = {q, 3};
+    }
+  }
+}
+
+// ---- 站姿 ----
+constexpr uint16_t STAND_MS = 1200;
+void buildStand() {
+  for (uint8_t l = 0; l < 4; l++) {
+    setPose(standPose[l][0], l, 0, 0, STAND_MS);
+    standPhase[0].s[l] = {standPose[l], 1};
+  }
+}
+
+// ---- 收腳：依序抬腿、髖回中立、放下 ----
+constexpr uint16_t SETTLE_LIFT_MS = 500;
+constexpr uint16_t SETTLE_DOWN_MS = 300;
+void buildSettle() {
+  for (uint8_t k = 0; k < SETTLE_PHASES; k++) {
+    uint8_t s = ORDER[k];
+    for (uint8_t l = 0; l < 4; l++) settlePhase[k].s[l] = {nullptr, 0};
+    setPose(settlePose[k][0], s, 0, LIFT[s], SETTLE_LIFT_MS);
+    setPose(settlePose[k][1], s, 0, 0,       SETTLE_DOWN_MS);
+    settlePhase[k].s[s] = {settlePose[k], 2};
+  }
+}
+
+// ---- 轉向 ----
+void buildTurn(int8_t dir) {
+  float xs[4], xe[4];
+  for (uint8_t l = 0; l < 4; l++) {
+    int8_t side = (l == 0 || l == 2) ? 1 : -1;
+    xs[l] = dir * side * TURN_S;
+    xe[l] = -xs[l];
+  }
+
+  for (uint8_t p = 0; p < TURN_PHASES; p++)
+    for (uint8_t l = 0; l < 4; l++) turnPhase[p].s[l] = {nullptr, 0};
+
+  for (uint8_t l = 0; l < 4; l++) {                       // 階段 1
+    setPose(turnPose[0][l][0], l, xe[l], 0, TURN_BODY_MS);
+    turnPhase[0].s[l] = {turnPose[0][l], 1};
+  }
+  for (uint8_t k = 0; k < 4; k++) {                       // 階段 2~5
+    uint8_t s = ORDER[k];
+    Pose* q = turnPose[k + 1][s];
+    setPose(q[0], s, xe[s], LIFT[s], TURN_LIFT_MS);
+    setPose(q[1], s, xs[s], LIFT[s], TURN_SWING_MS);
+    setPose(q[2], s, xs[s], 0,       TURN_LIFT_MS);
+    turnPhase[k + 1].s[s] = {q, 3};
+  }
+  for (uint8_t l = 0; l < 4; l++) {                       // 階段 6
+    setPose(turnPose[5][l][0], l, xe[l], 0, TURN_BODY_MS);
+    turnPhase[5].s[l] = {turnPose[5][l], 1};
+  }
+  for (uint8_t k = 0; k < 4; k++) {                       // 階段 7~10
+    uint8_t s = ORDER[k];
+    Pose* q = turnPose[6 + k][s];
+    setPose(q[0], s, xe[s], LIFT[s], TURN_LIFT_MS);
+    setPose(q[1], s, 0,     LIFT[s], TURN_SWING_MS);
+    setPose(q[2], s, 0,     0,       TURN_LIFT_MS);
+    turnPhase[6 + k].s[s] = {q, 3};
+  }
+}
 
 struct LegMotion {
   const Pose* seq = nullptr;
@@ -132,7 +213,7 @@ struct LegMotion {
     const Pose& p = seq[idx];
     float u = p.ms ? (millis() - t0) / (float)p.ms : 1.0f;
     if (u > 1.0f) u = 1.0f;
-    float e = u * u * (3.0f - 2.0f * u);   // smoothstep
+    float e = u * u * (3.0f - 2.0f * u);
     bool done = (u >= 1.0f);
 
     for (int i = 0; i < 3; i++)
@@ -146,16 +227,31 @@ struct LegMotion {
 };
 
 LegMotion motionLeg[4];
-uint8_t phase   = 0;       // 0 閒置，1~7 = 目前階段
-bool    looping = false;
+
+const Phase* curTable = gaitPhase;
+uint8_t phase       = 0;
+bool    looping     = false;
+bool    turning     = false;
+uint8_t turnLeft    = 0;
+int8_t  pendingTurn = 0;
+
+void resetState() {
+  phase = 0;
+  looping = false;
+  turning = false;
+  pendingTurn = 0;
+  curTable = gaitPhase;
+  for (int i = 0; i < 4; i++) motionLeg[i].active = false;
+}
+
+bool busyStandOrSettle() {
+  return phase != 0 && (curTable == standPhase || curTable == settlePhase);
+}
 
 // ---------- 指令 ----------
 void stopAll() {
   Serial.println("clearing");
-  phase = 0;
-  looping = false;
-  curSet = FIRST_SET; curPhases = FIRST_PHASES;
-  for (int i = 0; i < 4; i++) motionLeg[i].active = false;
+  resetState();
   for (int ch = 0; ch < 16; ch++) {
     pwm.setPWM(ch, 0, 4096);
     curAngle[ch] = NAN;
@@ -166,10 +262,7 @@ void stopAll() {
 
 void reload() {
   Serial.println("reloading");
-  phase = 0;
-  looping = false;
-  curSet = FIRST_SET; curPhases = FIRST_PHASES;
-  for (int i = 0; i < 4; i++) motionLeg[i].active = false;
+  resetState();
   for (int leg = 0; leg < 3; leg += 2) {
     for (int j = 0; j < 3; j++) {
       setServoEx(legs[leg][j],     HOME[leg][j],     true);
@@ -183,12 +276,31 @@ void reload() {
 // ---------- 階段控制 ----------
 void startPhase(uint8_t p) {
   phase = p;
-  Serial.print("階段 "); Serial.print(p); Serial.print("/"); Serial.println(curPhases);
-  const Phase& ph = curSet[p - 1];
+  Serial.print(turning ? "轉向階段 " : "階段 "); Serial.println(p);
+  const Phase& ph = curTable[p - 1];
   for (uint8_t i = 0; i < 4; i++)
     if (ph.s[i].p) motionLeg[i].start(ph.s[i].p, ph.s[i].n);
   for (uint8_t i = 0; i < 4; i++)
-    if (ph.s[i].p && !motionLeg[i].active) { phase = 0; return; }   // 位置未知等失敗
+    if (ph.s[i].p && !motionLeg[i].active) {   // 位置未知等失敗
+      resetState();
+      return;
+    }
+}
+
+void beginStand() {
+  Serial.println("站立");
+  looping = false; turning = false; pendingTurn = 0;
+  curTable = standPhase;
+  startPhase(1);
+}
+
+void beginTurn(int8_t dir) {
+  Serial.println(dir > 0 ? "開始右轉" : "開始左轉");
+  buildTurn(dir);
+  curTable = turnPhase;
+  turning = true;
+  turnLeft = TURN_CYCLES;
+  startPhase(1);
 }
 
 void updatePhase() {
@@ -196,37 +308,106 @@ void updatePhase() {
   for (uint8_t i = 0; i < 4; i++)
     if (motionLeg[i].active) return;   // 本階段還有腳在動
 
-  if (phase < curPhases) {
+  // 收腳 → 站立
+  if (curTable == settlePhase) {
+    if (phase < SETTLE_PHASES) startPhase(phase + 1);
+    else beginStand();
+    return;
+  }
+
+  // 站立完成：回到可接任何指令的閒置狀態
+  if (curTable == standPhase) {
+    Serial.println("站立完成");
+    resetState();
+    return;
+  }
+
+  // 轉向
+  if (turning) {
+    if (phase == 6) {
+      if (turnLeft > 1) { turnLeft--; startPhase(2); }
+      else startPhase(7);
+    } else if (phase < TURN_PHASES) {
+      startPhase(phase + 1);
+    } else {
+      Serial.println("轉向完成");
+      resetState();
+    }
+    return;
+  }
+
+  // 走路
+  if (phase < PHASES) {
     startPhase(phase + 1);
   } else if (looping) {
-    Serial.println("下一輪（循環組）");
-    curSet = LOOP_SET; curPhases = LOOP_PHASES;
-    startPhase(1);
+    startPhase(2);
   } else {
-    Serial.println("全部完成");
+    Serial.println("走路已停止");
     phase = 0;
+    if (pendingTurn) {
+      int8_t d = pendingTurn;
+      pendingTurn = 0;
+      beginTurn(d);
+    }
   }
 }
 
-void startWalkLoop() {
-  looping = true;
-  curSet = FIRST_SET; curPhases = FIRST_PHASES;
+// e：立刻中斷，依序收腳後站立
+void softStop() {
+  if (busyStandOrSettle()) { Serial.println("收腳 / 站立中，請稍候"); return; }
+  if (phase == 0) { Serial.println("已經停止"); return; }
+  Serial.println("中斷動作，依序收腳後站立");
+  for (int i = 0; i < 4; i++) motionLeg[i].active = false;
+  looping = false; turning = false; pendingTurn = 0;
+  curTable = settlePhase;
   startPhase(1);
+}
+
+// t：閒置時直接站立；走路 / 轉向中則先收腳再站立
+void stand() {
+  if (busyStandOrSettle()) { Serial.println("收腳 / 站立中，請稍候"); return; }
+  if (phase != 0) { softStop(); return; }
+  beginStand();
+}
+
+void startWalkLoop() {
+  if (busyStandOrSettle()) { Serial.println("收腳 / 站立中，請稍候"); return; }
+  if (turning)             { Serial.println("轉向中，請稍候"); return; }
+  looping = true;
+  pendingTurn = 0;
+  curTable = gaitPhase;
+  startPhase(1);
+}
+
+// dir：+1 右轉，-1 左轉
+void turnCommand(int8_t dir) {
+  if (busyStandOrSettle()) { Serial.println("收腳 / 站立中，請稍候"); return; }
+  if (turning || pendingTurn) { Serial.println("轉向中，請稍候"); return; }
+  if (phase != 0) {
+    looping = false;
+    pendingTurn = dir;
+    Serial.println("先停止走路，走完這圈後轉向");
+  } else {
+    beginTurn(dir);
+  }
 }
 
 void action3() {
   Serial.println("動作 3：尚未設定");
 }
 
-// ---------- 指令入口（序列埠與網頁共用）----------
+// ---------- 指令入口 ----------
 void handleCommand(char c) {
   switch (c) {
-    case 's': stopAll();       break;
-    case 'r': reload();        break;
-    case 'w': startWalkLoop(); break;
-    case 'e': looping = false; Serial.println("本輪結束後停止"); break;
-    case 'c': action3();       break;
-    default:  Serial.println("指令：s 斷電 / r 歸位 / w 循環走 / e 本輪後停止 / c"); break;
+    case 's': stopAll();        break;
+    case 'r': reload();         break;
+    case 'w': startWalkLoop();  break;
+    case 'e': softStop();       break;
+    case 'a': turnCommand(-1);  break;
+    case 'd': turnCommand(+1);  break;
+    case 't': stand();          break;
+    case 'c': action3();        break;
+    default:  Serial.println("指令：s 斷電 / r 歸位 / t 站立 / w 走 / e 收腳站立 / a 左轉 / d 右轉"); break;
   }
 }
 
@@ -238,13 +419,18 @@ const char PAGE[] PROGMEM = R"HTML(
 <style>
 body{font-family:sans-serif;text-align:center;margin:0;padding:16px}
 button{width:90%;height:70px;margin:8px 0;font-size:24px;border:0;border-radius:12px;color:#fff}
-.r{background:#2980b9}.w{background:#27ae60}.e{background:#e67e22}.s{background:#c0392b}
+.half{width:44%;margin:8px 1%}
+.r{background:#2980b9}.w{background:#27ae60}.e{background:#e67e22}.s{background:#c0392b}.t{background:#8e44ad}
 #st{margin-top:12px;color:#555}
 </style></head><body>
 <h2>Robot Control</h2>
 <button class="r" onclick="cmd('r')">歸位 (r)</button>
+<button class="r" onclick="cmd('t')">站立 (t)</button>
 <button class="w" onclick="cmd('w')">開始走 (w)</button>
-<button class="e" onclick="cmd('e')">本輪後停止 (e)</button>
+<div>
+<button class="t half" onclick="cmd('a')">左轉 (a)</button><button class="t half" onclick="cmd('d')">右轉 (d)</button>
+</div>
+<button class="e" onclick="cmd('e')">收腳站立 (e)</button>
 <button class="s" onclick="cmd('s')">立刻斷電 (s)</button>
 <div id="st"></div>
 <script>
@@ -290,6 +476,10 @@ void setup() {
     lastUs[ch] = 0;
   }
   Serial.println("Stop all output");
+
+  buildGait();
+  buildStand();
+  buildSettle();
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
